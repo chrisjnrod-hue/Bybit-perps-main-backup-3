@@ -1,0 +1,493 @@
+// src/routes/debug.js
+/**
+ * Debug routes (safe, lazy DB access).
+ *
+ * Important: this file intentionally does NOT call dbModule.get() at module load time,
+ * because the DB is initialized later in src/index.js. Each handler calls getDb()
+ * to obtain the DB instance and returns a 503 if it's not ready yet.
+ */
+
+const express = require('express');
+const router = express.Router();
+const pino = require('pino');
+const logger = pino();
+
+const fs = require('fs');
+const path = require('path');
+
+const dbModule = require('../db'); // do NOT call dbModule.get() here
+const wsManager = require('../services/bybitWs');
+const poller = require('../services/poller');
+const config = require('../config');
+const bybitRest = require('../services/bybitRest');
+const marketData = require('../services/marketData'); // <- used by admin seeding/inspection
+
+let manualIntervalId = null;
+
+function getDbOrThrow() {
+  const db = dbModule.get();
+  if (!db) {
+    const err = new Error('Database not initialized');
+    err.code = 'DB_NOT_READY';
+    throw err;
+  }
+  return db;
+}
+
+function msToNext5m() {
+  const d = new Date();
+  const m = d.getUTCMinutes();
+  const deltaM = 5 - (m % 5);
+  const next = new Date(d);
+  next.setUTCMinutes(m + deltaM);
+  next.setUTCSeconds(0);
+  next.setUTCMilliseconds(0);
+  return Math.max(0, next - d);
+}
+
+// Admin guard for the admin endpoints
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+
+// simple admin guard (checks header X-ADMIN-TOKEN or query admin_token)
+function requireAdmin(req, res, next) {
+  const token = req.header('X-ADMIN-TOKEN') || req.query.admin_token || '';
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'forbidden - invalid admin token' });
+  }
+  return next();
+}
+
+// Health
+router.get('/health', (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
+
+// Status summary
+router.get('/status', (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const symbolCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
+    const tradeCount = db.prepare('SELECT COUNT(*) as c FROM trades').get().c || 0;
+    res.json({ ok: true, ts: Date.now(), symbolCount, tradeCount, env: { NODE_ENV: process.env.NODE_ENV || null, PORT: process.env.PORT || null } });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'status handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// List symbols
+router.get('/symbols', (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const rows = db.prepare('SELECT symbol, base, quote, fetched_at, price, market_cap, volume_24h, prev_volume_24h FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT 2000').all();
+    res.json({ ok: true, count: rows.length, rows });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'symbols handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Single symbol details
+router.get('/symbols/:symbol', (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const { symbol } = req.params;
+    const row = db.prepare('SELECT * FROM symbols WHERE symbol = ?').get(symbol);
+    if (!row) return res.status(404).json({ ok: false, error: 'not found' });
+    res.json({ ok: true, row });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'symbol detail handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Klines for a symbol/timeframe
+router.get('/klines/:symbol/:tf', (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const { symbol, tf } = req.params;
+    const rows = db.prepare('SELECT open_time, open, high, low, close, volume FROM klines WHERE symbol = ? AND timeframe = ? ORDER BY open_time DESC LIMIT 500').all(symbol, tf);
+    res.json({ ok: true, symbol, timeframe: tf, count: rows.length, rows });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'klines handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Trades list
+router.get('/trades', (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const rows = db.prepare('SELECT * FROM trades ORDER BY opened_at DESC LIMIT 200').all();
+    res.json({ ok: true, count: rows.length, rows });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'trades handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// WS subscriptions
+router.get('/ws/subscriptions', (req, res) => {
+  try {
+    const connections = {};
+    for (let i = 0; i < wsManager.connections.length; i++) {
+      const c = wsManager.connections[i];
+      connections[i] = { id: c.id, symbols: Array.from(c.symbols || []), topics: Array.from(c._topics || []) };
+    }
+    res.json({ ok: true, connections });
+  } catch (err) {
+    logger.error({ err }, 'ws subscriptions handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Time until next aligned 5m scan
+router.get('/scan/next', (req, res) => {
+  try {
+    const ms = msToNext5m();
+    res.json({ ok: true, msToNext5m: ms, nextAt: new Date(Date.now() + ms).toISOString() });
+  } catch (err) {
+    logger.error({ err }, 'scan/next handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Trigger a manual full scan once (backgrounded)
+router.post('/scan', (req, res) => {
+  try {
+    getDbOrThrow();
+
+    // Schedule the scan to run in background and return immediately
+    setImmediate(async () => {
+      try {
+        logger.info('Manual background scan started');
+        if (typeof poller.scanOnce === 'function') {
+          await poller.scanOnce();
+        } else {
+          logger.warn('poller.scanOnce not available');
+        }
+        logger.info('Manual background scan completed');
+      } catch (err) {
+        logger.error({ err }, 'Manual background scan failed');
+      }
+    });
+
+    return res.json({ ok: true, message: 'scan scheduled in background; check logs for progress' });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'manual scan error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Trigger a scan for a single symbol's root TFs
+router.post('/scan/symbol', async (req, res) => {
+  try {
+    getDbOrThrow();
+    const body = req.body || {};
+    const symbol = body.symbol;
+    if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required in JSON body' });
+    if (typeof poller.scanSymbolRoots !== 'function') {
+      return res.status(500).json({ ok: false, error: 'poller.scanSymbolRoots not available' });
+    }
+    // run symbol scan in background for responsiveness
+    setImmediate(() => {
+      poller.scanSymbolRoots(symbol).catch(err => logger.error({ err }, 'scanSymbolRoots error'));
+    });
+    res.json({ ok: true, message: `scanSymbolRoots scheduled for ${symbol}` });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'scan/symbol error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Start/stop manual interval scanner for testing
+router.post('/scan/startInterval', (req, res) => {
+  try {
+    if (manualIntervalId) return res.status(400).json({ ok: false, error: 'manual interval already running' });
+    const body = req.body || {};
+    const secs = Math.max(5, Number(body.intervalSeconds) || 30);
+    manualIntervalId = setInterval(() => {
+      logger.info('Manual interval triggered scanOnce');
+      poller.scanOnce().catch(err => logger.error({ err }, 'manual interval scanOnce error'));
+    }, secs * 1000);
+    res.json({ ok: true, message: 'manual interval started', intervalSeconds: secs });
+  } catch (err) {
+    logger.error({ err }, 'startInterval error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+router.post('/scan/stopInterval', (req, res) => {
+  try {
+    if (!manualIntervalId) return res.status(400).json({ ok: false, error: 'no manual interval running' });
+    clearInterval(manualIntervalId);
+    manualIntervalId = null;
+    res.json({ ok: true, message: 'manual interval stopped' });
+  } catch (err) {
+    logger.error({ err }, 'stopInterval error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Seed specific symbols (existing handler)
+router.post('/seed', async (req, res) => {
+  try {
+    getDbOrThrow();
+    const body = req.body || {};
+    const symbols = Array.isArray(body.symbols) ? body.symbols : null;
+    if (!symbols || !symbols.length) return res.status(400).json({ ok: false, error: 'symbols array required' });
+    for (const s of symbols) {
+      for (const tf of (config.ROOT_TFS || [])) {
+        if (typeof poller.seedKlinesForSymbol === 'function') {
+          await poller.seedKlinesForSymbol(s, tf);
+        }
+      }
+    }
+    res.json({ ok: true, message: `Seeded ${symbols.length} symbols` });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'seed handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * Bybit debug endpoints
+ */
+
+// GET /debug/bybit/probe-status
+router.get('/bybit/probe-status', (req, res) => {
+  try {
+    const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: null };
+    res.json({ ok: true, probe: info });
+  } catch (err) {
+    logger.error({ err }, 'bybit/probe-status handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// POST /debug/bybit/probe
+router.post('/bybit/probe', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const timeoutMs = Number(body.timeoutMs) || 5000;
+    if (typeof bybitRest.reprobe !== 'function') {
+      return res.status(500).json({ ok: false, error: 'bybitRest.reprobe not available' });
+    }
+    const base = await bybitRest.reprobe(timeoutMs);
+    const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: base };
+    res.json({ ok: true, chosenBase: base, probeInfo: info });
+  } catch (err) {
+    logger.error({ err }, 'bybit/probe handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * POST /debug/bybit/seed
+ * - Fetches symbols via bybitRest.fetchAllSymbols() (which will fallback to CoinGecko)
+ * - Inserts them into the symbols table (INSERT OR REPLACE)
+ * - Returns inserted count plus verification (savedCount and sample rows) and forces WAL checkpoint
+ */
+router.post('/bybit/seed', async (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    if (typeof bybitRest.fetchAllSymbols !== 'function') {
+      return res.status(500).json({ ok: false, error: 'bybitRest.fetchAllSymbols not available' });
+    }
+
+    const body = req.body || {};
+    const limit = body.limit && Number.isFinite(Number(body.limit)) ? Number(body.limit) : null;
+
+    const symbols = await bybitRest.fetchAllSymbols();
+    if (!Array.isArray(symbols) || symbols.length === 0) {
+      return res.status(500).json({ ok: false, error: 'fetchAllSymbols returned no symbols' });
+    }
+
+    const toInsert = limit ? symbols.slice(0, limit) : symbols;
+    const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
+    const now = Date.now();
+    const insertMany = db.transaction((rows) => {
+      for (const it of rows) {
+        if (!it || !it.symbol) continue;
+        const base = it.base || String(it.symbol).replace(/USDT$/i, '');
+        const quote = it.quote || 'USDT';
+        insert.run(it.symbol, base, quote, now);
+      }
+    });
+    insertMany(toInsert);
+    logger.info({ count: toInsert.length }, 'bybit/seed: symbols saved into DB');
+
+    // Force a WAL checkpoint so data is visible in the main DB file and across restarts
+    try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); // flush and truncate WAL
+      logger.info('SQLite WAL checkpoint completed');
+    } catch (ckErr) {
+      logger.debug({ ckErr }, 'WAL checkpoint failed (non-fatal)');
+    }
+
+    // Verification: read back count and a sample of saved rows (same DB handle)
+    const savedCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
+    const sampleRows = db.prepare('SELECT symbol, base, quote FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT 10').all();
+
+    res.json({ ok: true, inserted: toInsert.length, savedCount, sample: sampleRows });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'bybit/seed handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * GET /debug/bybit/db-info
+ * - Returns the expected DB path and whether the file exists and its size (helps verify persistence)
+ * - Also lists files in the data directory so you can see db.sqlite-wal
+ */
+router.get('/bybit/db-info', (req, res) => {
+  try {
+    const dataDir = path.join(__dirname, '..', 'data');
+    let files = [];
+    try {
+      const names = fs.readdirSync(dataDir);
+      files = names.map(n => {
+        try {
+          const s = fs.statSync(path.join(dataDir, n));
+          return { name: n, sizeBytes: s.size };
+        } catch (e) {
+          return { name: n, error: String(e) };
+        }
+      });
+    } catch (e) {
+      // directory may not exist yet
+      files = [];
+    }
+    const mainPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'db.sqlite');
+    res.json({ ok: true, dbPath: mainPath, files });
+  } catch (err) {
+    logger.error({ err }, 'bybit/db-info handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * --- ADMIN: background seeding + market-data inspection endpoints ---
+ *
+ * POST/GET /debug/admin/seedMarketData?admin_token=...  (starts background job; returns jobId)
+ * GET     /debug/admin/seedStatus?jobId=...&admin_token=...  (poll job status)
+ * GET     /debug/admin/marketdata?symbol=SYMBOL&admin_token=...  (inspect results)
+ *
+ * Protect with ADMIN_TOKEN env var. The background seed is sequential and conservative by default.
+ */
+
+// in-memory job registry (kept for 1 hour by default)
+const seedJobs = new Map(); // jobId -> { startedAt, status, processed, total, errors, limit }
+
+router.all('/admin/seedMarketData', requireAdmin, async (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    let rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+    if (!rows || rows.length === 0) {
+      return res.json({ ok: true, message: 'no symbols in DB' });
+    }
+
+    // optional ?limit=N to process only first N symbols (handy for testing)
+    const limitParam = req.query.limit || (req.body && req.body.limit) || null;
+    const limit = limitParam ? Math.max(1, Number(limitParam)) : null;
+    if (limit) {
+      rows = rows.slice(0, limit);
+    }
+
+    const total = rows.length;
+    const jobId = `seed_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    seedJobs.set(jobId, { startedAt: Date.now(), status: 'queued', processed: 0, total, errors: [], limit: limit || null });
+
+    // background worker
+    setImmediate(async () => {
+      const job = seedJobs.get(jobId);
+      if (!job) return;
+      job.status = 'running';
+      const delayMs = Number(process.env.MARKET_SEED_DELAY_MS || 500);
+
+      for (const r of rows) {
+        const symbol = String(r.symbol || '').trim();
+        if (!symbol) continue;
+
+        try {
+          await marketData.updateSymbolMarketData(symbol);
+          job.processed += 1;
+        } catch (err) {
+          job.processed += 1;
+          job.errors.push({ symbol, error: String(err && err.message) });
+          logger.debug({ err, symbol }, 'admin: marketData.updateSymbolMarketData failed for symbol (continuing)');
+        }
+
+        // respect configured delay between calls to be friendly to APIs
+        if (delayMs > 0) {
+          await new Promise((rs) => setTimeout(rs, delayMs));
+        }
+      }
+
+      job.status = 'completed';
+      job.completedAt = Date.now();
+
+      // auto-cleanup after 1 hour
+      setTimeout(() => {
+        seedJobs.delete(jobId);
+      }, 1000 * 60 * 60);
+    });
+
+    return res.json({ ok: true, jobId, total, message: 'seeding started in background; poll /debug/admin/seedStatus?jobId=...' });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'admin/seedMarketData failed to start');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+// pollable status endpoint
+router.get('/admin/seedStatus', requireAdmin, (req, res) => {
+  try {
+    const jobId = String(req.query.jobId || '').trim();
+    if (!jobId) return res.status(400).json({ ok: false, error: 'jobId query param required' });
+    const job = seedJobs.get(jobId);
+    if (!job) return res.status(404).json({ ok: false, error: 'job not found or expired' });
+    return res.json({ ok: true, jobId, status: job });
+  } catch (err) {
+    logger.error({ err }, 'admin/seedStatus failed');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+// Inspect market_data + recent history for one symbol
+router.get('/admin/marketdata', requireAdmin, (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ ok: false, error: 'symbol query parameter required' });
+
+    const current = db.prepare(
+      'SELECT symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data WHERE symbol = ?'
+    ).get(symbol);
+
+    const history = db.prepare(
+      'SELECT id, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data_history WHERE symbol = ? ORDER BY updated_at DESC LIMIT 10'
+    ).all(symbol);
+
+    return res.json({ ok: true, symbol, current: current || null, history: history || [] });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'admin/marketdata failed');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+/* end admin endpoints */
+
+module.exports = router;

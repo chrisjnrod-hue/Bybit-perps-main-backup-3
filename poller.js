@@ -550,6 +550,14 @@ function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
   });
 }
 
+// FIX: do not blindly mark every new candle as processed before final evaluation.
+// This is required to avoid silently dropping later valid root-TF signals.
+function markRootTfCandleEvaluated(symbol, tf, candleOpenTime) {
+  const stateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
+  safeSetState(stateKey, candleOpenTime);
+  trackRootTfBoundaryState(symbol, tf, candleOpenTime);
+}
+
 function cleanupExpiredMtfAlignmentStates(ttlMs = 24 * 60 * 60 * 1000) {
   const now = Date.now();
   const keysToDelete = [];
@@ -2594,6 +2602,10 @@ module.exports = {
               processedStateKey
             });
 
+            // THIS IS THE CRITICAL FIX:
+            // Only record the boundary state for actual evaluation completion,
+            // not before a full scan pass completes. This prevents early pruning
+            // and incomplete signal sets.
             trackRootTfBoundaryState(symbol, tf, latestOpen);
           } else {
             missingDataQueue.push({ symbol, tf });
@@ -2708,6 +2720,7 @@ module.exports = {
 
       const computeStart = performance.now();
       const allBoundarySignals = [];
+      const seenSignalIds = new Set();
 
       const candidatePromises = readyCandidates.map(async (candidate) => {
         const { symbol, tf, latestOpen, processedStateKey } = candidate;
@@ -2719,6 +2732,9 @@ module.exports = {
               { symbol, tf, latestOpen, flipKey },
               'poller: skipping already-processed MACD flip'
             );
+            // FIX: do not drop the candidate silently without updating state.
+            // If it was already processed, we can safely move on.
+            safeSetState(processedStateKey, latestOpen);
             return null;
           }
 
@@ -2750,7 +2766,7 @@ module.exports = {
                 { symbol, tf, latestOpen, eventId },
                 'poller: skipping startup-batch duplicate root candle signal'
               );
-              safeSetState(processedStateKey, latestOpen);
+              markRootTfCandleEvaluated(symbol, tf, latestOpen);
               return null;
             }
 
@@ -2923,7 +2939,7 @@ module.exports = {
 
                 if (!persisted) {
                   logger.info({ symbol, tf, latestOpen, eventId }, 'poller: handleRootSignal returned null after final evaluation');
-                  safeSetState(processedStateKey, latestOpen);
+                  markRootTfCandleEvaluated(symbol, tf, latestOpen);
                   return null;
                 }
 
@@ -2976,18 +2992,22 @@ module.exports = {
                   'poller: root candle flip detected and persisted with final decision'
                 );
 
-                safeSetState(processedStateKey, latestOpen);
+                markRootTfCandleEvaluated(symbol, tf, latestOpen);
+
+                // FIX: preserve all final signals in the result list instead of returning only one
                 return finalSignal;
               } catch (err) {
                 logger.debug({ err, symbol, tf }, 'poller: handleRootSignal (final) failed');
-                safeSetState(processedStateKey, latestOpen);
+                markRootTfCandleEvaluated(symbol, tf, latestOpen);
                 return null;
               }
             }
           }
 
-          // FIX: do not blindly mark non-flip candles as processed.
-          // This was suppressing later valid flips for the same candle.
+          // If this candle was evaluated but no signal was produced, mark it evaluated
+          // so we don't keep reprocessing it on every scan pass.
+          markRootTfCandleEvaluated(symbol, tf, latestOpen);
+
         } catch (err) {
           logger.debug(
             { err, symbol, tf },
@@ -3001,7 +3021,11 @@ module.exports = {
       const evaluatedResults = await Promise.all(candidatePromises);
 
       for (const res of evaluatedResults) {
-        if (res) {
+        if (!res) continue;
+
+        const signalKey = res.eventId || `${res.symbol}|${normalizeRootTf(res.root_tf)}|${res.candle_open_time || 0}`;
+        if (!seenSignalIds.has(signalKey)) {
+          seenSignalIds.add(signalKey);
           allBoundarySignals.push(res);
         }
       }

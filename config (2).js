@@ -52,8 +52,6 @@ module.exports = {
   BYBIT_API_KEY: process.env.BYBIT_API_KEY || '',
   BYBIT_API_SECRET: process.env.BYBIT_API_SECRET || '',
 
-  OPENTRADE: envBool('OPENTRADE', false) || envBool('ENABLE_OPEN_TRADES', false),
-
   // ---------------------------
   // Performance / speed tuning
   // ---------------------------
@@ -88,21 +86,9 @@ module.exports = {
   // ---------------------------
   // Root / MTF scan config
   // ---------------------------
-  ROOT_TFS: parseList(process.env.ROOT_TFS, ['240', 'D', '60']),
+  
   MTF_TFS: parseList(process.env.MTF_TFS, ['15', '60', '240', 'D']),
 
-  ROOT_TF_TRADE_PRIORITY: parseList(process.env.ROOT_TF_TRADE_PRIORITY, ['240', 'D', '60']),
-  ROOT_TFS_PRIORITY: parseList(process.env.ROOT_TFS_PRIORITY, ['240', 'D', '60']),
-
-  PRIORITIZE_ROOT_TFS: envBool('PRIORITIZE_ROOT_TFS', true),
-  ROOT_SCAN_INTERVAL_SECS: envInt('ROOT_SCAN_INTERVAL_SECS', 0),
-  ROOT_MIDSCAN_INTERVAL: envInt('ROOT_MIDSCAN_INTERVAL', 0),
-  ROOT_SCAN_5MIN_BOUNDARY: envBool('ROOT_SCAN_5MIN_BOUNDARY', true),
-
-  ROOT_CANDLE_OPEN_SCAN_ENABLED: envBool('ROOT_CANDLE_OPEN_SCAN_ENABLED', false),
-  ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS: envInt('ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS', 60),
-
-  // ---------------------------
   // Trade settings
   // ---------------------------
   DEFAULT_ACCOUNT_EQUITY_USD: envFloat('DEFAULT_ACCOUNT_EQUITY_USD', 10000),
@@ -127,32 +113,9 @@ module.exports = {
   // Signal gating / quality
   // ---------------------------
   MIN_TV_RATING: envFloat('MIN_TV_RATING', 0.6),
-  MTF_ALIGNMENT_RATING: envFloat('MTF_ALIGNMENT_RATING', 0.6),
-
-  ENFORCE_MTF_FLIP_1D: envBool('ENFORCE_MTF_FLIP_1D', false),
-  MTF_FLIP_REQUIREMENT_1D: envString('MTF_FLIP_REQUIREMENT_1D', '1h,4h,1d'),
-
-  VALIDATE_SIGNAL_FLIP_AT_OPEN: envBool('VALIDATE_SIGNAL_FLIP_AT_OPEN', false),
-  SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT: envFloat('SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT', 0.5),
+  
 
   MAX_CONSECUTIVE_ROOT_SIGNALS_1D: envInt('MAX_CONSECUTIVE_ROOT_SIGNALS_1D', 2),
-
-  // ---------------------------
-  // Liquidity or volume checks
-  // ---------------------------
-  LIQUIDITY_CHECK_ENABLED: envBool('LIQUIDITY_CHECK_ENABLED', false),
-  LIQUIDITY_GATE_DRY_RUN: envBool('LIQUIDITY_GATE_DRY_RUN', true),
-  LIQUIDITY_MIN_USDT_DEPTH: envFloat('LIQUIDITY_MIN_USDT_DEPTH', 5000),
-  LIQUIDITY_DEPTH_MULTIPLIER: envFloat('LIQUIDITY_DEPTH_MULTIPLIER', 3),
-  LIQUIDITY_CHECK_TOP_LEVELS: envInt('LIQUIDITY_CHECK_TOP_LEVELS', 10),
-
-  MIN_24H_VOLUME_MULTIPLIER: envFloat('MIN_24H_VOLUME_MULTIPLIER', 5),
-  MIN_24H_VOLUME_ABSOLUTE: envFloat('MIN_24H_VOLUME_ABSOLUTE', 5000),
-  MIN_24H_VOLUME_CHANGE_PCT: envFloat('MIN_24H_VOLUME_CHANGE_PCT', -1000),
-
-  MIN_24H_VOLUME: envFloat('MIN_24H_VOLUME', 100000),
-  MIN_24H_USDT_VOLUME: envFloat('MIN_24H_USDT_VOLUME', 0),
-  MIN_MARKET_CAP: envFloat('MIN_MARKET_CAP', 0),
 
   // ---------------------------
   // Telegram / notifications
@@ -163,18 +126,9 @@ module.exports = {
   TELEGRAM_SEND_DELAY_MS: envInt('TELEGRAM_SEND_DELAY_MS', 250),
   TELEGRAM_PUSH_FULL: envBool('TELEGRAM_PUSH_FULL', false),
 
-  NEW_ROOT_CANDLE_NOTIFY: envBool('NEW_ROOT_CANDLE_NOTIFY', true),
+  
   ALIGNMENT_CONFIRMATION_ALERT: envBool('ALIGNMENT_CONFIRMATION_ALERT', true),
 
-  // ---------------------------
-  // TradingView / technical scoring
-  // ---------------------------
-  USE_INTERNAL_TECHNICAL_RATING: envBool('USE_INTERNAL_TECHNICAL_RATING', true),
-  TV_REQUEST_TIMEOUT_MS: envInt('TV_REQUEST_TIMEOUT_MS', 9000),
-  TRADINGVIEW_EXCHANGE_CANDIDATES: envString('TRADINGVIEW_EXCHANGE_CANDIDATES', 'BYBIT,BINANCE,KUCOIN'),
-  TV_USE_SYMBOL_SEARCH: envBool('TV_USE_SYMBOL_SEARCH', true),
-  TV_SYMBOL_SEARCH_LIMIT: envInt('TV_SYMBOL_SEARCH_LIMIT', 12),
-  TV_CACHE_TTL_MS: envInt('TV_CACHE_TTL_MS', 1800000),
 
   // ---------------------------
   // DB / runtime / health
@@ -186,8 +140,6 @@ module.exports = {
   KEEPALIVE_URL: process.env.KEEPALIVE_URL || '',
   KEEPALIVE_INTERVAL_MS: envInt('KEEPALIVE_INTERVAL_MS', 5 * 60 * 1000),
 
-  COINGECKO_ENABLED: envBool('COINGECKO_ENABLED', false),
-
   CLOSE_LEAST_PROFITABLE_ENABLED: envBool('CLOSE_LEAST_PROFITABLE_ENABLED', false),
   CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY: envInt('CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY', 5),
 
@@ -198,12 +150,8 @@ module.exports = {
   BYBIT_ORDER_BASE: process.env.BYBIT_ORDER_BASE || '',
   MAINNET: envBool('MAINNET', true),
   BYBIT_USE_TESTNET: envBool('BYBIT_USE_TESTNET', false),
-  OPENTRADES: envBool('OPENTRADES', false),
-  ENABLE_OPEN_TRADES: envBool('ENABLE_OPEN_TRADES', false),
 
-  // Legacy compatibility with older env names
-  DEFAULT_ACCOUNT_EQUITY: envFloat('DEFAULT_ACCOUNT_EQUITY', 10000),
-  ROOT_TF_TRADE_PRIORITY_LIST: parseList(process.env.ROOT_TF_TRADE_PRIORITY_LIST, ['240', 'D', '60']),
+  ENABLE_OPEN_TRADES: envBool('ENABLE_OPEN_TRADES', false),
 
   // Safety no-op placeholders
   BYBIT_REST_TIMEOUT_MS: envInt('BYBIT_REST_TIMEOUT_MS', 7000),

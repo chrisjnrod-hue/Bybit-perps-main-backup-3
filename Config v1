@@ -1,0 +1,23 @@
+/**
+ * config.js
+ * Central configuration file wired to environment variables with default fallbacks.
+ */
+
+require('dotenv').config(); // Loads variables from your .env file
+
+const botConfig = {
+  // Account & Scaling Limits
+  maxNumberOfOpenTrades: parseInt(process.env.MAX_OPEN_TRADES || '1', 10), // Starts at 1 for $10 account, scales to 3 later
+  
+  // Risk & Trade Parameters (Using your exact specs)
+  riskPercentage: parseFloat(process.env.RISK_PERCENTAGE || '0.01'),          // Risk 1% of account equity per trade
+  stopLossPercentage: parseFloat(process.env.STOP_LOSS_PERCENTAGE || '0.015'),// Your 1.5% stop-loss distance
+  takeProfitPercentage: parseFloat(process.env.TAKE_PROFIT_PERCENTAGE || '0.10'), // Your 10.0% take-profit target
+  
+  // Microstructure Safety Guardrails
+  maxAllowedSpread: parseFloat(process.env.MAX_ALLOWED_SPREAD || '0.0005'),     // 0.05% max spread (air-pocket protection)
+  maxDepthImpact: parseFloat(process.env.MAX_DEPTH_IMPACT || '0.10'),         // 10% max order book impact cap
+  minNotional: parseFloat(process.env.MIN_NOTIONAL || '5.0')                  // Bybit minimum order threshold ($5 USDT)
+};
+
+module.exports = botConfig;

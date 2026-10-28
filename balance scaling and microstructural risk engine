@@ -1,0 +1,191 @@
+/**
+ * Bybit V5 Automated Bot: Balance-Scaling, Microstructure Filter, 
+ * & State Integration Engine (Node.js v18+)
+ */
+
+const crypto = require('crypto');
+
+// Configuration Settings
+const BYBIT_API_URL = 'https://api.bybit.com'; // Switch to 'https://api-testnet.bybit.com' for testing
+const API_KEY = process.env.BYBIT_API_KEY || 'YOUR_API_KEY';
+const API_SECRET = process.env.BYBIT_API_SECRET || 'YOUR_API_SECRET';
+
+// --- YOUR BOT CONFIGURATION VARIABLES ---
+let maxNumberOfOpenTrades = 1;      // Starts at 1 for your $10 account, scales to 3 later
+const stopLossPercentage = 0.02;    // Your existing stop-loss distance (2%)
+const riskPercentage = 0.01;        // Risk 1% of total account equity per trade
+const MAX_ALLOWED_SPREAD = 0.0005;  // Max allowable bid-ask spread (0.05%)
+const MAX_DEPTH_IMPACT = 0.10;      // Order cannot consume > 10% of total book depth in range
+const BYBIT_MIN_NOTIONAL = 5.0;     // Minimum USDT notional required by Bybit per order
+
+// Simulated runtime state tracker
+let currentOpenTrades = 0;
+
+/**
+ * Generates HMAC SHA256 signature for Bybit V5 Private Endpoints
+ */
+function signRequest(timestamp, apiKey, secret, queryString) {
+  const signString = timestamp + apiKey + '5000' + queryString;
+  return crypto.createHmac('sha256', secret).update(signString).digest('hex');
+}
+
+/**
+ * 1. Fetch Live Account Balance & Equity from Bybit Unified Account
+ */
+async function getAccountBalance() {
+  const endpoint = '/v5/account/wallet-balance?accountType=UNIFIED';
+  const timestamp = Date.now().toString();
+  const recvWindow = '5000';
+  const signature = signRequest(timestamp, API_KEY, API_SECRET, `accountType=UNIFIED`);
+
+  const response = await fetch(`${BYBIT_API_URL}${endpoint}`, {
+    method: 'GET',
+    headers: {
+      'X-BAPI-API-KEY': API_KEY,
+      'X-BAPI-TIMESTAMP': timestamp,
+      'X-BAPI-SIGN': signature,
+      'X-BAPI-RECV-WINDOW': recvWindow,
+    },
+  });
+
+  const data = await response.json();
+  if (data.retCode !== 0) {
+    throw new Error(`Bybit Balance API Error: ${data.retMsg}`);
+  }
+
+  const accountInfo = data.result.list[0];
+  const usdtCoin = accountInfo.coin.find(c => c.coin === 'USDT');
+  
+  return {
+    walletBalance: parseFloat(usdtCoin.walletBalance),
+    availableBalance: parseFloat(usdtCoin.availableToWithdraw),
+    equity: parseFloat(usdtCoin.equity) // Dynamically scaling metric
+  };
+}
+
+/**
+ * 2. Fetch Order Book Depth and Analyze Microstructure
+ */
+async function analyzeOrderBook(symbol, side = 'Buy') {
+  const endpoint = `/v5/market/orderbook?category=linear&symbol=${symbol}&limit=50`;
+
+  const response = await fetch(`${BYBIT_API_URL}${endpoint}`);
+  const data = await response.json();
+  
+  if (data.retCode !== 0) {
+    throw new Error(`Bybit Orderbook API Error: ${data.retMsg}`);
+  }
+
+  const { b: bids, a: asks } = data.result;
+  const bestBid = parseFloat(bids[0][0]);
+  const bestAsk = parseFloat(asks[0][0]);
+  const midPrice = (bestBid + bestAsk) / 2;
+
+  // Check Spread (Air-pocket protection)
+  const spread = (bestAsk - bestBid) / bestBid;
+
+  // Calculate cumulative liquidity value within a 0.5% threshold from mid-price
+  const thresholdPercentage = 0.005; 
+  let targetDepthValue = 0;
+
+  if (side === 'Buy') {
+    for (const ask of asks) {
+      const price = parseFloat(ask[0]);
+      const size = parseFloat(ask[1]);
+      if (price <= midPrice * (1 + thresholdPercentage)) {
+        targetDepthValue += price * size;
+      } else {
+        break;
+      }
+    }
+  } else {
+    for (const bid of bids) {
+      const price = parseFloat(bid[0]);
+      const size = parseFloat(bid[1]);
+      if (price >= midPrice * (1 - thresholdPercentage)) {
+        targetDepthValue += price * size;
+      } else {
+        break;
+      }
+    }
+  }
+
+  return { bestBid, bestAsk, midPrice, spread, targetDepthValue };
+}
+
+/**
+ * 3. Core Trade Evaluator: Balances Account Scaling with Microstructure Guards
+ */
+async function evaluateAndSizeTrade(symbol, side) {
+  console.log(`\n--------------------------------------------------`);
+  console.log(`[Bot Engine] Evaluating Multi-Timeframe Signal for ${symbol} (${side})`);
+
+  // Guard 1: Check your open trades limit before doing anything else
+  if (currentOpenTrades >= maxNumberOfOpenTrades) {
+    console.log(`❌ ABORT: Max open trades limit reached (${currentOpenTrades}/${maxNumberOfOpenTrades}). Skipping.`);
+    return { execute: false, reason: 'MAX_TRADES_REACHED' };
+  }
+
+  try {
+    // Step 1: Scale position against real-time account equity ($10 starting balance)
+    const balance = await getAccountBalance();
+    console.log(`> Account Equity: $${balance.equity.toFixed(2)} USDT`);
+
+    const riskAmountUSD = balance.equity * riskPercentage;
+    const rawPositionNotional = riskAmountUSD / stopLossPercentage;
+    console.log(`> Raw Target Position Size: $${rawPositionNotional.toFixed(2)} USDT`);
+
+    // Step 2: Query live market depth & microstructure
+    const book = await analyzeOrderBook(symbol, side);
+    console.log(`> Market Spread: ${(book.spread * 100).toFixed(4)}%`);
+    console.log(`> Order Book Depth (0.5% range): $${book.targetDepthValue.toFixed(2)} USDT`);
+
+    // Guard 2: Spread Check (Air-Pocket / Thin Liquidity check)
+    if (book.spread > MAX_ALLOWED_SPREAD) {
+      console.warn(`❌ ABORT: Spread too wide (${(book.spread * 100).toFixed(4)}%). High slippage risk.`);
+      return { execute: false, reason: 'EXCESSIVE_SPREAD' };
+    }
+
+    // Guard 3: Order Book Impact Cap
+    const maxSafeNotional = book.targetDepthValue * MAX_DEPTH_IMPACT;
+    let finalPositionNotional = Math.min(rawPositionNotional, maxSafeNotional);
+
+    // Guard 4: Bybit Minimum Notional Enforcement (Crucial for $10 account setup)
+    if (finalPositionNotional < BYBIT_MIN_NOTIONAL) {
+      console.warn(`❌ ABORT: Position size ($${finalPositionNotional.toFixed(2)}) is below Bybit's minimum notional requirement ($${BYBIT_MIN_NOTIONAL}).`);
+      return { execute: false, reason: 'BELOW_MIN_NOTIONAL' };
+    }
+
+    if (finalPositionNotional < rawPositionNotional) {
+      console.log(`⚠️ WARNING: Position scaled down to $${finalPositionNotional.toFixed(2)} to protect against slippage.`);
+    } else {
+      console.log(`✅ APPROVED: Trade validated at optimal account-scaled size.`);
+    }
+
+    return {
+      execute: true,
+      symbol,
+      side,
+      notionalSize: finalPositionNotional,
+      stopLossLevel: stopLossPercentage,
+      estimatedEntry: side === 'Buy' ? book.bestAsk : book.bestBid
+    };
+
+  } catch (error) {
+    console.error(`🚨 Error processing trade evaluation:`, error.message);
+    return { execute: false, reason: 'API_ERROR' };
+  }
+}
+
+// --- Example execution handler block in your main bot loop ---
+async function runBotCycle(symbol, side) {
+  const decision = await evaluateAndSizeTrade(symbol, side);
+  
+  if (decision.execute) {
+    // Increment tracking count
+    currentOpenTrades++;
+    
+    console.log(`🚀 Sending order to Bybit: ${decision.side} ${decision.symbol} for $${decision.notionalSize.toFixed(2)} notional.`);
+    // TODO: Insert your actual Bybit order placement function here using `decision.notionalSize` and `decision.stopLossLevel`
+  }
+}
